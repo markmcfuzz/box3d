@@ -233,6 +233,13 @@ static void OnEvent( const sapp_event* e )
 						s_context.showMetrics = !s_context.showMetrics;
 						break;
 
+					// **THE REPLAY VIEWER'S CAMERA KEYS -- V, T, Y -- ARE NOT HERE.** They live in
+					// ReplayViewer::Keyboard, reached through `default:` below, because T is already
+					// sample_character's own third person toggle and a case in this switch jumps in
+					// front of the dispatch that would have delivered it. Only one sample runs at a
+					// time, so scoping them to the sample that owns them costs nothing and stops the
+					// two features fighting over a key.
+
 					case SAPP_KEYCODE_R:
 						SelectSample( &s_context, s_context.sampleIndex, true );
 						break;
@@ -529,6 +536,26 @@ static sapp_desc BuildAppDesc( int argc, char** argv )
 				snprintf( s_context.replayFile, sizeof( s_context.replayFile ), "%s", path );
 				s_sampleOverride = g_replayIndex;
 			}
+		}
+		else if ( strcmp( argv[i], "--follow" ) == 0 )
+		{
+			s_context.replayFollow = true;
+
+			// A writer that rebuilds its world every window needs the viewer to re-find what it was
+			// watching by NAME; ordinals shift as bodies come and go. "player" is the default because
+			// that is what Mjolnir labels the biped capsule.
+			if ( s_context.replayFollowBody[0] == '\0' )
+			{
+				snprintf( s_context.replayFollowBody, sizeof( s_context.replayFollowBody ), "player" );
+			}
+		}
+		else if ( strcmp( argv[i], "--fpv" ) == 0 )
+		{
+			s_context.replayFirstPerson = true;
+		}
+		else if ( strcmp( argv[i], "--followbody" ) == 0 && i + 1 < argc )
+		{
+			snprintf( s_context.replayFollowBody, sizeof( s_context.replayFollowBody ), "%s", argv[++i] );
 		}
 		else if ( strcmp( argv[i], "--zup" ) == 0 )
 		{

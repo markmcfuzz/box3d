@@ -17,8 +17,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 // Whole-recording query index, built lazily by scanning the player once. Backs the search box.
 struct QueryIndexRow
@@ -130,6 +136,31 @@ static ImVec4 PanelColor( b3HexColor hexColor )
 }
 
 // Number of b3RecQueryType values, for per-kind bookkeeping in the outline and search.
+// The category bit a recorder is expected to put its own avatar on, so first person can drop it.
+// Mjolnir sets exactly this on the player's collider and aim marker; see player_body.lua.
+static constexpr uint64_t kFirstPersonHiddenCategory = 2;
+
+// How far behind the eye the third person camera sits, in metres, on the frame T is pressed. The
+// wheel takes over from there, so this is only where it starts.
+//
+// A Halo biped is about 2.1 m tall, but the useful distance is not set by the biped -- it is set by
+// how much of what it is walking into has to be in frame with it. 3 m, then 5 m, both too close.
+// Mark, 2026-08-19: "ponle 15 metros igual al biped".
+static constexpr float kThirdPersonDistance = 15.0f;
+
+// The wheel is the only camera input third person allows, and it must not be able to zoom all the
+// way into the biped -- that is first person, and V already does it better.
+static constexpr float kThirdPersonMinDistance = 0.6f;
+
+// A vehicle gets the same distance as a biped: the thing being framed is the scene around it either
+// way. Kept as its own constant so the two can part company again without hunting for the call site.
+static constexpr float kRideDistance = 15.0f;
+
+// The recorder publishes this body for exactly as long as the player is in a vehicle, on the
+// VEHICLE's transform rather than the rider's -- a camera pulled back from a head sitting inside a
+// Warthog frames it off-centre and swings with the driver's aim. See player_body.lua's updateRide.
+static constexpr const char* kRideBodyName = "driver";
+
 static constexpr int ReplayQueryTypeCount = 7;
 
 // Outline text and the 3D overlay share one color per query kind, so a row reads as the geometry it
@@ -268,6 +299,12 @@ public:
 
 		snprintf( m_path, sizeof( m_path ), "%s", m_context->replayFile );
 
+		m_follow = m_context->replayFollow;
+		m_followCountdown = 6;
+		m_firstPerson = m_context->replayFirstPerson;
+		m_thirdPerson = m_context->replayThirdPerson;
+		m_followStamp = 0;
+
 		// A fresh open gathers the keyframe policy through the Load popup, then pre-generates every
 		// keyframe behind a progress bar. A restart reuses the persisted policy and fills the ring
 		// lazily so R stays quick.
@@ -275,7 +312,16 @@ public:
 		{
 			if ( strlen( m_path ) > 0 )
 			{
-				m_requestLoadPopup = true;
+				// A path given on the command line is already the answer the popup would ask for, so
+				// --replay loads straight away. Follow mode reloads the same way.
+				if ( m_context->replayFollow )
+				{
+					CreatePlayer( false );
+				}
+				else
+				{
+					m_requestLoadPopup = true;
+				}
 			}
 			else
 			{
@@ -295,6 +341,10 @@ public:
 		ClosePlayer();
 		m_context->showMetrics = m_prevShowMetrics;
 		m_context->viewZUp = m_prevViewZUp;
+
+		// The camera outlives this sample. Leaving its input locked to wheel-zoom would hand the
+		// next sample a view it cannot orbit and no way to tell why.
+		m_camera->m_thirdPerson = false;
 	}
 
 	void ClosePlayer()
@@ -321,7 +371,11 @@ public:
 	// Load m_path into a fresh player and adopt its world. Sets m_status on any failure: missing
 	// file, bad header, or deserialization error. Pre-generation of the keyframe ring is done by the
 	// Load popup, not here, so the open stays responsive.
-	void CreatePlayer()
+	// `live` is a reload under Follow file rather than a fresh open. Two things must not happen on
+	// one: re-framing, which yanks the camera back and undoes any zoom the user just did, and
+	// rewinding to frame 0, which replays a window that is already history. Both were the difference
+	// between a viewer you can work in and one you cannot.
+	void CreatePlayer( bool live = false )
 	{
 		ClosePlayer();
 
@@ -369,12 +423,25 @@ public:
 		m_replayWorldId = b3RecPlayer_GetWorldId( m_player );
 		m_info = b3RecPlayer_GetInfo( m_player );
 		snprintf( m_status, sizeof( m_status ), "loaded" );
-
-		// Frame the recorded motion on a fresh open. A restart keeps the user's current camera.
-		if ( m_context->restart == false )
+		// Frame the recorded motion on a fresh open. A restart, or a live reload, keeps the camera.
+		if ( m_context->restart == false && live == false )
 		{
 			FrameRecording();
 		}
+
+		// Jump to the newest frame. Without this a live reload starts at frame 0 and plays the window
+		// forward, so what is on screen lags the writer by the window length TWICE over: once waiting
+		// for it to be written, once replaying it.
+		if ( live && m_info.frameCount > 0 )
+		{
+			b3RecPlayer_SeekFrame( m_player, m_info.frameCount - 1 );
+		}
+
+		// **AFTER THE SEEK, NOT BEFORE.** Wiring the debug-shape callbacks rebuilds the world and
+		// rewinds it to frame 0, and a body that the recording creates later does not exist there:
+		// measured `count 1` against a recording with six bodies. Step() retries anyway, so a fresh
+		// open parked at frame 0 still finds its target once playback reaches it.
+		SelectFollowedBody();
 	}
 
 	// Fit the view to the recorded bounds for the current up axis. The player applies the recording's
@@ -382,6 +449,48 @@ public:
 	// the fit lands at the wrong distance. Reused on a Z-up toggle, where the transform rotates about
 	// the sim origin and would otherwise swing the bounds out of view. An empty extent means an older
 	// recording with no bounds record, so leave the default view.
+	// Find a body by name. Ordinals shift on every reload of a live recording, so a name is the only
+	// handle that survives; `ordinal` comes back for the selection, which is stored as one.
+	b3BodyId FindBodyByName( const char* name, int* ordinal ) const
+	{
+		if ( m_player == nullptr || name == nullptr || name[0] == 0 )
+		{
+			return b3_nullBodyId;
+		}
+
+		int count = b3RecPlayer_GetBodyCount( m_player );
+
+		for ( int i = 0; i < count; ++i )
+		{
+			b3BodyId body = b3RecPlayer_GetBodyId( m_player, i );
+			const char* found = b3Body_IsValid( body ) ? b3Body_GetName( body ) : nullptr;
+
+			if ( found != nullptr && strcmp( found, name ) == 0 )
+			{
+				if ( ordinal != nullptr )
+				{
+					*ordinal = i;
+				}
+				return body;
+			}
+		}
+
+		return b3_nullBodyId;
+	}
+
+	// Select the body whose name matches the follow target, if there is one, and turn following on.
+	void SelectFollowedBody()
+	{
+		int ordinal = -1;
+
+		if ( B3_IS_NON_NULL( FindBodyByName( m_context->replayFollowBody, &ordinal ) ) )
+		{
+			m_selKind = SelBody;
+			m_selBodyOrdinal = ordinal;
+			m_followSelection = true;
+		}
+	}
+
 	void FrameRecording()
 	{
 		if ( m_player == nullptr )
@@ -395,6 +504,22 @@ public:
 			m_camera->SetRenderTransform( b3GetLengthUnitsPerMeter(), m_context->viewZUp );
 			float aspect = m_camera->m_height > 0 ? (float)m_camera->m_width / (float)m_camera->m_height : 1.0f;
 			m_camera->Frame( m_info.bounds, aspect, 0.75f );
+
+			// **THE CULL BOX IS A CUBE OF drawDistance AROUND THE EYE, NOT AROUND THE PIVOT.** Framing a
+			// large recording puts the eye hundreds of metres out, and at the 100 m default the box then
+			// misses the scene completely: measured on a 384 x 443 x 156 m recording, DrawShape calls 0
+			// with drawBounds (336 -850 157)..(536 -650 357) against content at (18 -580 -4)..(402 -137
+			// 152). A perfectly good recording that draws nothing at all.
+			//
+			// Framing therefore has to open the box far enough to contain what it just framed.
+			float radius = 0.5f * b3Length( extent );
+			float needed = 1.1f * ( m_camera->m_radius + radius );
+
+			if ( m_context->drawDistance < needed )
+			{
+				m_context->drawDistance = b3MinFloat( needed, Camera::kViewDistance );
+				m_camera->SetDrawDistance( m_context->drawDistance );
+			}
 		}
 	}
 
@@ -531,7 +656,51 @@ public:
 			return;
 		}
 
-		if ( m_player == nullptr || action != ACTION_PRESS || ( mods & ( MOD_CTRL | MOD_ALT ) ) != 0 )
+		if ( action != ACTION_PRESS || ( mods & ( MOD_CTRL | MOD_ALT ) ) != 0 )
+		{
+			return;
+		}
+
+		// **THREE CAMERAS ON THREE KEYS.** They are checkboxes in the replay panel too, but a
+		// checkbox is no good when the point is to glance between the game and the viewer -- each of
+		// these has to be one key. Handled HERE rather than in main.cpp's global switch: T is
+		// sample_character's own third person toggle, and a global case would jump in front of the
+		// dispatch that delivers it. Ahead of the m_player guard, so Y always gets the free camera
+		// back even with nothing loaded.
+		if ( key == KEY_V )
+		{
+			// First person: on the eye marker, looking where it looks.
+			m_context->replayFirstPerson = !m_context->replayFirstPerson;
+
+			if ( m_context->replayFirstPerson )
+			{
+				m_context->replayThirdPerson = false;
+			}
+			return;
+		}
+
+		if ( key == KEY_T )
+		{
+			// Third person: the same aim, pulled back so the biped itself is in shot.
+			m_context->replayThirdPerson = !m_context->replayThirdPerson;
+
+			if ( m_context->replayThirdPerson )
+			{
+				m_context->replayFirstPerson = false;
+			}
+			return;
+		}
+
+		if ( key == KEY_Y )
+		{
+			// Straight back to the free camera from either, without having to remember which one
+			// is on.
+			m_context->replayFirstPerson = false;
+			m_context->replayThirdPerson = false;
+			return;
+		}
+
+		if ( m_player == nullptr )
 		{
 			return;
 		}
@@ -544,8 +713,72 @@ public:
 		}
 	}
 
+	// About ten times a second. The writer publishes by rename, so a poll either sees the previous
+	// complete file or the new one and never a half-written one -- which is what makes this affordable.
+	// It is pure latency on top of the writer's own window, so it is kept small on purpose.
+	void PollFollow()
+	{
+		if ( m_follow == false || strlen( m_path ) == 0 )
+		{
+			return;
+		}
+
+		if ( --m_followCountdown > 0 )
+		{
+			return;
+		}
+
+		// Every other frame. The recorder rolls several times a second now, and a poll slower than
+		// the roll simply throws windows away -- which is most of what made the viewer feel behind
+		// the game (Mark, 2026-08-18: "no se actualiza en tiempo real, tiene delay").
+		m_followCountdown = 2;
+
+		uint64_t stamp = 0;
+
+#ifdef _WIN32
+		// **_stat64's st_mtime IS ONE-SECOND RESOLUTION, AND THAT IS NOT ENOUGH ANY MORE.** Two rolls
+		// inside the same second differ only in body positions, so the file size is very often
+		// identical byte for byte -- the size tiebreak that carried this at two rolls a second stops
+		// carrying it at six, and the viewer silently sits on a stale window. FILETIME is 100 ns.
+		WIN32_FILE_ATTRIBUTE_DATA attributes;
+		if ( GetFileAttributesExA( m_path, GetFileExInfoStandard, &attributes ) == 0 )
+		{
+			return;
+		}
+
+		stamp = ( (uint64_t)attributes.ftLastWriteTime.dwHighDateTime << 32 ) |
+				(uint64_t)attributes.ftLastWriteTime.dwLowDateTime;
+		stamp = stamp * 1000003u + ( ( (uint64_t)attributes.nFileSizeHigh << 32 ) | attributes.nFileSizeLow );
+#else
+		struct _stat64 info;
+		if ( _stat64( m_path, &info ) != 0 )
+		{
+			return;
+		}
+
+		stamp = (uint64_t)info.st_mtime * 1000003u + (uint64_t)info.st_size;
+#endif
+
+		if ( stamp == m_followStamp )
+		{
+			return;
+		}
+
+		m_followStamp = stamp;
+		CreatePlayer( true );
+	}
+
 	void Step() override
 	{
+		PollFollow();
+
+		// Cheap and only while nothing is selected: a body named as the follow target may not exist
+		// at the frame the player happens to be parked on.
+		if ( m_selKind == SelNone )
+		{
+			SelectFollowedBody();
+		}
+
 		SetDrawOrigin( m_camera->DrawOrigin() );
 
 		// Generation runs inside the imgui frame (DrawLoadPopup). While it fast-forwards, the world is
@@ -649,7 +882,21 @@ public:
 			ClearSelection();
 		}
 
-		b3World_Draw( m_replayWorldId, &debugDraw, B3_DEFAULT_MASK_BITS );
+		// **IN FIRST PERSON THE CAMERA IS INSIDE THE VIEWER'S OWN COLLIDER, SO STOP DRAWING IT.**
+		// Sitting at the eye means sitting inside the body the eye belongs to, and box3d happily draws
+		// that body's back faces -- the whole view goes flat blue and nothing else is visible at all.
+		//
+		// b3World_Draw filters the broadphase by category, so a recorder that puts its own avatar on one
+		// category and nothing else can have it dropped here. Mjolnir uses bit 1 for the player capsule
+		// and its aim marker. A recording that does not follow that convention loses nothing: default
+		// categories are all bits set, so clearing one still matches.
+		uint64_t drawMask = B3_DEFAULT_MASK_BITS;
+		if ( m_context->replayFirstPerson )
+		{
+			drawMask &= ~kFirstPersonHiddenCategory;
+		}
+
+		b3World_Draw( m_replayWorldId, &debugDraw, drawMask );
 
 		// Overlay query geometry and recorded hits on top of the world. The toggle draws every recorded
 		// query, otherwise just the selected one. Re-resolve the pinned query to this frame so a repeated
@@ -741,6 +988,50 @@ public:
 	// center of mass, the stable point to watch even while a shape spins about it. A query tracks the
 	// center of its recorded bounds. False when the selection resolves to nothing at this frame, which
 	// happens before a body spawns or on a frame that does not issue the pinned query.
+	// Drive the camera from a body's transform rather than orbiting it.
+	//
+	// The camera is an orbit rig, so first person is the pivot ON the eye at the minimum radius, with
+	// yaw/pitch derived from where the body faces. Two conversions are involved and both matter: the
+	// body's forward is its local +X (see units.h, Halo's basis is forward/left/up), and the display
+	// frame is Y-up, so a simulation vector (x, y, z) draws as (x, z, -y). ForwardFromAngles gives the
+	// pivot -> camera direction, which is the NEGATIVE of where we are looking.
+	// `radius` is how far back the camera orbits from the body: a tenth of a metre is first person,
+	// a few metres is third. Everything else about the two modes is identical, which is the whole
+	// reason they share this.
+	bool AimCameraFromBody( b3BodyId body, float radius )
+	{
+		if ( b3Body_IsValid( body ) == false )
+		{
+			return false;
+		}
+
+		b3Vec3 forward = b3RotateVector( b3Body_GetRotation( body ), b3Vec3{ 1.0f, 0.0f, 0.0f } );
+
+		b3Vec3 d;
+		if ( m_context->viewZUp )
+		{
+			d = b3Vec3{ -forward.x, -forward.z, forward.y };
+		}
+		else
+		{
+			d = b3Vec3{ -forward.x, -forward.y, -forward.z };
+		}
+
+		float length = b3Length( d );
+		if ( length < 1.0e-6f )
+		{
+			return false;
+		}
+		d = b3MulSV( 1.0f / length, d );
+
+		float pitch = asinf( b3ClampFloat( d.y, -1.0f, 1.0f ) );
+		float yaw = atan2f( d.x, d.z );
+
+		m_camera->SetTarget( b3Body_GetPosition( body ) );
+		m_camera->SetOrbit( yaw, pitch, radius );
+		return true;
+	}
+
 	bool FollowTarget( b3Pos* position ) const
 	{
 		if ( m_player == nullptr )
@@ -779,6 +1070,97 @@ public:
 	// Ride the selection. Returns true when the eye moved, so the caller can relatch the draw origin.
 	bool UpdateFollowCamera()
 	{
+		// **FIRST PERSON IS ITS OWN MODE, not a variation on Follow Selection.** It was nested inside
+		// it at first, so ticking it did nothing until something happened to be selected -- and the
+		// body it wants is not a selection at all.
+		//
+		// A collision capsule carries no aim: pitching it would tilt the very shape that decides what
+		// the player can push. So Mjolnir writes a separate zero-collision body named "eye" that does,
+		// and the outline selection stays free for whatever is being inspected.
+		// **LEAVING FIRST PERSON HAS TO GIVE THE FREE CAMERA BACK.** First person parks the orbit at a
+		// tenth of a metre, so without this you come out of it pressed against whatever you were
+		// standing in, with no way to tell where you are. The orbit is saved on the way in and put
+		// back on the way out, which makes V a real toggle between two usable views rather than a
+		// one-way trip (Mark, 2026-08-18: "Necesitamos poder cambiar entre FP y camara libre").
+		// **THE SAVE AND RESTORE IS PER ATTACHMENT, NOT PER MODE.** Going straight from first person
+		// to third with T must not overwrite the saved free camera with the first person one -- that
+		// is parked at a tenth of a metre inside the biped, and Y would then hand back a view from
+		// inside its chest. Only leaving BOTH modes restores, and only entering from neither saves.
+		const bool firstPerson = m_context->replayFirstPerson;
+		const bool thirdPerson = m_context->replayThirdPerson && firstPerson == false;
+		const bool attached = firstPerson || thirdPerson;
+		const bool wasAttached = m_firstPerson || m_thirdPerson;
+
+		if ( attached != wasAttached )
+		{
+			if ( attached )
+			{
+				m_freePivot = m_camera->m_pivot;
+				m_freeYaw = m_camera->m_yaw;
+				m_freePitch = m_camera->m_pitch;
+				m_freeRadius = m_camera->m_radius;
+				m_hasFreeCamera = true;
+			}
+			else if ( m_hasFreeCamera )
+			{
+				m_camera->SetPivot( m_freePivot );
+				m_camera->SetOrbit( m_freeYaw, m_freePitch, m_freeRadius );
+			}
+		}
+
+		// **Camera::m_thirdPerson IS THE INPUT MODE, not the view.** It locks orbit and pan out and
+		// leaves the wheel driving m_radius, which is exactly the third person a viewer wants: the
+		// aim comes from the biped, the distance comes from you.
+		const bool enteringThird = thirdPerson && m_thirdPerson == false;
+
+		m_camera->m_thirdPerson = thirdPerson;
+		m_firstPerson = firstPerson;
+		m_thirdPerson = thirdPerson;
+
+		if ( attached )
+		{
+			// The eye marker. A collision shape carries no aim -- pitching it would tilt the very
+			// shape that decides what the player can push -- so the recorder writes a separate
+			// zero-collision body that does. The camera turns with the biped because it is reading
+			// the biped's own facing.
+			b3BodyId eye = FindBodyByName( "eye", nullptr );
+
+			// **IN A VEHICLE, THIRD PERSON RIDES THE VEHICLE.** The ride marker exists only while
+			// the player is in one, so its mere presence is the answer -- there is nothing to
+			// configure and it holds for every vehicle. First person stays on the eye: sitting where
+			// the driver sits is the point of that mode.
+			b3BodyId rideBody = thirdPerson ? FindBodyByName( kRideBodyName, nullptr ) : b3_nullBodyId;
+			const bool riding = B3_IS_NON_NULL( rideBody );
+
+			// Read the radius back rather than forcing it, or the wheel would be undone every frame.
+			// Only the frame that enters the mode -- or the frame the player boards -- parks it.
+			float radius = 0.12f;
+
+			if ( thirdPerson )
+			{
+				const bool park = enteringThird || riding != m_riding;
+				const float parked = riding ? kRideDistance : kThirdPersonDistance;
+
+				radius = park ? parked : m_camera->m_radius;
+
+				if ( radius < kThirdPersonMinDistance )
+				{
+					radius = kThirdPersonMinDistance;
+				}
+			}
+
+			m_riding = riding;
+
+			b3BodyId target = riding ? rideBody : ( B3_IS_NON_NULL( eye ) ? eye : SelectedBody() );
+
+			if ( AimCameraFromBody( target, radius ) )
+			{
+				return true;
+			}
+		}
+
+		m_riding = false;
+
 		b3Pos position;
 		if ( m_followSelection == false || FollowTarget( &position ) == false )
 		{
@@ -854,6 +1236,21 @@ public:
 	// transport in the Timeline tab.
 	bool DrawControls() override
 	{
+		// Above the null check on purpose: waiting for a file that does not exist yet is exactly when
+		// following is wanted.
+		if ( ImGui::Checkbox( "Follow file", &m_follow ) )
+		{
+			// Reload on the next poll rather than remembering whatever was on disk when it was
+			// switched off.
+			m_followStamp = 0;
+			m_followCountdown = 1;
+		}
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "Reload %s whenever it changes on disk", m_path );
+		}
+
 		if ( m_player == nullptr )
 		{
 			ImGui::TextWrapped( "%s", m_status );
@@ -873,6 +1270,29 @@ public:
 		// cursor is untouched, so picking and the scene tree keep working while it follows. The
 		// silhouette outline drops while following, since a centered body needs no pointing at.
 		ImGui::Checkbox( "Follow Selection", &m_followSelection );
+		if ( ImGui::Checkbox( "First Person (V)", &m_context->replayFirstPerson )
+			 && m_context->replayFirstPerson )
+		{
+			m_context->replayThirdPerson = false;
+		}
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "Camera sits on the selected body and looks the way it faces.\n"
+							   "Select \"player eye\" for the game's own view." );
+		}
+
+		if ( ImGui::Checkbox( "Third Person (T)", &m_context->replayThirdPerson )
+			 && m_context->replayThirdPerson )
+		{
+			m_context->replayFirstPerson = false;
+		}
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "The same aim pulled back behind the body, so it turns with it "
+							   "and stays in shot. Y returns to the free camera from either." );
+		}
 
 		// View-only stand-up for recordings authored with +Z as up. The simulation is untouched.
 		// Reframe on a toggle so the rotated bounds stay centered, matching the fit done on load.
@@ -1788,6 +2208,32 @@ public:
 	b3RecPlayerInfo m_info;	   // cached at load for the timeline readout and camera framing
 	char m_path[256];
 	char m_status[128];
+
+	// Follow mode: reload m_path whenever it changes on disk, so a process that keeps rewriting the
+	// same recording can be watched while it runs. Added for Mjolnir, which rolls a short window out
+	// of a live Halo session.
+	bool m_follow;
+	int m_followCountdown;
+	uint64_t m_followStamp;
+
+	// Put the camera ON a body and point it the way that body faces, for matching what the game's own
+	// first person view shows. Needs a body that carries an ORIENTATION, which a collision capsule
+	// does not: Mjolnir writes a separate "player eye" marker for exactly this.
+	bool m_firstPerson;
+
+	// The same, pulled back to kThirdPersonDistance so the body itself is in shot.
+	bool m_thirdPerson = false;
+
+	// Whether the last third person frame was riding a vehicle. Boarding and getting out both have
+	// to re-park the orbit, because 5 m frames a man and 10 m frames a Warthog.
+	bool m_riding = false;
+
+	// The free camera as it was before either mode took it over, so Y can hand it back.
+	b3Pos m_freePivot = {};
+	float m_freeYaw = 0.0f;
+	float m_freePitch = 0.0f;
+	float m_freeRadius = 0.0f;
+	bool m_hasFreeCamera = false;
 	float m_speed;
 	float m_frameAccumulator;
 	bool m_loop;

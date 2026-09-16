@@ -50,6 +50,20 @@ struct SampleContext
 	char recordingFile[256] = "recording.b3rec";
 	char replayFile[256] = "";
 
+	// Reload replayFile whenever it changes on disk, for watching a process that keeps rewriting it.
+	bool replayFollow = false;
+
+	// Body name the replay viewer re-selects after every load, so "Follow Selection" survives a reload
+	// and the camera can track something that is being recreated twice a second.
+	char replayFollowBody[64] = "";
+
+	// Start the replay viewer in first person on the "eye" marker, so the whole thing is one command.
+	bool replayFirstPerson = false;
+
+	// Third person on the same marker: behind the biped and turning with it. Mutually exclusive with
+	// replayFirstPerson -- V, T and Y pick between first, third and the free camera.
+	bool replayThirdPerson = false;
+
 	// Keyframe ring policy the Replay viewer applies on open, persisted across sessions.
 	int replayKeyframeBudgetMB = 512;
 	int replayKeyframeMinInterval = 16;
