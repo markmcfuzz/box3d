@@ -184,6 +184,13 @@ set(SAMPLE_FILES
     sample_world.cpp
 )
 
+# The Continuous samples pack two ints into a void*, which needs a 64-bit pointer and fails a
+# static_assert on a 32-bit host. Dropped there rather than silently truncated: a 32-bit samples build
+# exists to replay recordings written by a 32-bit process, and those do not need this sample.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+	list(REMOVE_ITEM SAMPLE_FILES sample_continuous.cpp)
+endif()
+
 add_executable(samples ${SAMPLE_FILES})
 
 if(APPLE)
