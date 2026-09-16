@@ -72,7 +72,12 @@ static inline uint32_t b3CTZ64( uint64_t block )
 
 static inline int b3PopCount64( uint64_t block )
 {
+#ifdef _WIN64
 	return (int)__popcnt64( block );
+#else
+	// 32-bit fall back, __popcnt64 is x64 only
+	return (int)( __popcnt( (uint32_t)block ) + __popcnt( (uint32_t)( block >> 32 ) ) );
+#endif
 }
 
 #else
