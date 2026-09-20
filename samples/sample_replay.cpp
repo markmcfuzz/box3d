@@ -713,6 +713,7 @@ public:
 		if ( key == KEY_V )
 		{
 			// First person: on the eye marker, looking where it looks.
+			m_rodeIntoThirdPerson = false;
 			m_context->replayFirstPerson = !m_context->replayFirstPerson;
 
 			if ( m_context->replayFirstPerson )
@@ -725,6 +726,7 @@ public:
 		if ( key == KEY_T )
 		{
 			// Third person: the same aim, pulled back so the biped itself is in shot.
+			m_rodeIntoThirdPerson = false;
 			m_context->replayThirdPerson = !m_context->replayThirdPerson;
 
 			if ( m_context->replayThirdPerson )
@@ -760,6 +762,7 @@ public:
 		{
 			// Straight back to the free camera from either, without having to remember which one
 			// is on.
+			m_rodeIntoThirdPerson = false;
 			m_context->replayFirstPerson = false;
 			m_context->replayThirdPerson = false;
 			return;
@@ -997,10 +1000,52 @@ public:
 		}
 	}
 
+	// **GETTING INTO A VEHICLE SHOULD CHANGE THE SHOT, NOT JUST THE VIEWPOINT.** First person on the eye
+	// marker is the right view on foot and the wrong one in a Warthog: the camera ends up inside the
+	// driver's head, framing the bonnet. The recorder publishes the "driver" body for exactly as long as
+	// the player is riding, so its appearance and disappearance are the mount and dismount.
+	//
+	// It fires on the TRANSITION, never continuously, so V and T still mean what they say while riding.
+	// And the return trip only happens if this is what put the camera in third person: press T yourself
+	// and getting out leaves you in third person, which is what you asked for.
+	void UpdateRideCamera()
+	{
+		if ( m_player == nullptr )
+		{
+			return;
+		}
+
+		const bool riding = B3_IS_NON_NULL( FindBodyByName( kRideBodyName, nullptr ) );
+		if ( riding == m_wasRiding )
+		{
+			return;
+		}
+		m_wasRiding = riding;
+
+		if ( riding )
+		{
+			if ( m_context->replayFirstPerson )
+			{
+				m_context->replayFirstPerson = false;
+				m_context->replayThirdPerson = true;
+				m_rodeIntoThirdPerson = true;
+			}
+			return;
+		}
+
+		if ( m_rodeIntoThirdPerson )
+		{
+			m_rodeIntoThirdPerson = false;
+			m_context->replayThirdPerson = false;
+			m_context->replayFirstPerson = true;
+		}
+	}
+
 	void Step() override
 	{
 		BeatHeartbeat();
 		PollFollow();
+		UpdateRideCamera();
 
 		// Cheap and only while nothing is selected: a body named as the follow target may not exist
 		// at the frame the player happens to be parked on.
@@ -1519,10 +1564,14 @@ public:
 		// only after the first and third person branches decline, which with first person on by default
 		// they do not -- all ticking it did was drop the selection outline. Following is still reachable
 		// where it means something, through --followbody.
-		if ( ImGui::Checkbox( "First Person (V)", &m_context->replayFirstPerson )
-			 && m_context->replayFirstPerson )
+		// Same as the keys: choosing a camera by hand takes the decision back from UpdateRideCamera.
+		if ( ImGui::Checkbox( "First Person (V)", &m_context->replayFirstPerson ) )
 		{
-			m_context->replayThirdPerson = false;
+			m_rodeIntoThirdPerson = false;
+			if ( m_context->replayFirstPerson )
+			{
+				m_context->replayThirdPerson = false;
+			}
 		}
 
 		if ( ImGui::IsItemHovered() )
@@ -1531,10 +1580,13 @@ public:
 							   "Select \"player eye\" for the game's own view." );
 		}
 
-		if ( ImGui::Checkbox( "Third Person (T)", &m_context->replayThirdPerson )
-			 && m_context->replayThirdPerson )
+		if ( ImGui::Checkbox( "Third Person (T)", &m_context->replayThirdPerson ) )
 		{
-			m_context->replayFirstPerson = false;
+			m_rodeIntoThirdPerson = false;
+			if ( m_context->replayThirdPerson )
+			{
+				m_context->replayFirstPerson = false;
+			}
 		}
 
 		if ( ImGui::IsItemHovered() )
@@ -2604,6 +2656,11 @@ public:
 	// Whether the last third person frame was riding a vehicle. Boarding and getting out both have
 	// to re-park the orbit, because 5 m frames a man and 10 m frames a Warthog.
 	bool m_riding = false;
+
+	// Whether the player was in a vehicle last frame, and whether THIS is what put the camera behind
+	// them, so getting out does not undo a third person the user asked for. See UpdateRideCamera.
+	bool m_wasRiding = false;
+	bool m_rodeIntoThirdPerson = false;
 
 	// The free camera as it was before either mode took it over, so Y can hand it back.
 	b3Pos m_freePivot = {};
