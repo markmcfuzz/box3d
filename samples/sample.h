@@ -57,8 +57,12 @@ struct SampleContext
 	// and the camera can track something that is being recreated twice a second.
 	char replayFollowBody[64] = "";
 
-	// Start the replay viewer in first person on the "eye" marker, so the whole thing is one command.
-	bool replayFirstPerson = false;
+	// The replay viewer opens in first person on the "eye" marker: watching a recording of a game is
+	// nearly always watching it from where it was played. V and Y leave it, --no-fpv opens without it.
+	bool replayFirstPerson = true;
+
+	// The replay viewer opens with object labels on. L toggles them, --no-labels opens without them.
+	bool replayLabels = true;
 
 	// Third person on the same marker: behind the biped and turning with it. Mutually exclusive with
 	// replayFirstPerson -- V, T and Y pick between first, third and the free camera.
