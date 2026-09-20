@@ -2303,28 +2303,34 @@ int b3World_GetWorkerCount( b3WorldId worldId )
 	return world->workerCount;
 }
 
-void b3World_StartRecording( b3WorldId worldId, b3Recording* recording )
+// **THESE REPORT WHETHER THEY TOOK.** A caller that hands the finished buffer to another thread has to
+// know: a refused stop leaves the world still appending to (and reallocating) the very bytes that
+// thread would be reading, and a refused start leaves the caller believing a session is open that is
+// not. Returning void made both of those silent.
+bool b3World_StartRecording( b3WorldId worldId, b3Recording* recording )
 {
 	// Must be a step boundary, so refuse a locked world
 	b3World* world = b3GetUnlockedWorldFromId( worldId );
 
 	if ( world == NULL || recording == NULL || world->recording != NULL )
 	{
-		return;
+		return false;
 	}
 
 	b3StartRecordingIntoBuffer( world, recording );
+	return true;
 }
 
-void b3World_StopRecording( b3WorldId worldId )
+bool b3World_StopRecording( b3WorldId worldId )
 {
 	b3World* world = b3GetUnlockedWorldFromId( worldId );
-	if ( world == NULL )
+	if ( world == NULL || world->recording == NULL )
 	{
-		return;
+		return false;
 	}
 
 	b3StopRecordingInternal( world );
+	return true;
 }
 
 void b3World_DumpMemoryStats( b3WorldId worldId )
