@@ -1141,13 +1141,25 @@ b3Recording* b3LoadRecordingFromFile( const char* path )
 }
 
 // Geometry interning helpers
+//
+// **THE REGISTRY KEY IS NOT RECOMPUTED.** Mesh, hull and height field each carry the content hash they
+// were built with, and hashing the blob again is by far the most expensive thing a re-seeded recording
+// does: a rolling window re-interns every piece of level geometry several times a second, and on 32-bit
+// x86 rapidhash runs an order of magnitude slower than the memcpy beside it because the 64x64 multiplies
+// are emulated. Measured in Halo at 1.4 MB of geometry: 2.53 ms a window to re-seed, against 0.10 ms to
+// memcpy the same bytes into the buffer.
+//
+// A different key is only a different bucket. The registry already walks a bucket comparing byteCount
+// and then the whole blob, so a collision between the two schemes costs one memcmp and still returns the
+// right id. The key is never written to the file -- b3RecWriteRegistry stores kind, byteCount and bytes.
+// The fallback keeps this honest for any blob that reaches here without a hash.
 
 uint32_t b3RecInternHull( b3Recording* rec, const b3HullData* hull )
 {
 	int byteCount = hull->byteCount;
 	uint8_t* bytes = b3Alloc( (size_t)byteCount );
 	memcpy( bytes, hull, (size_t)byteCount );
-	uint64_t h = b3Hash64NonZero( bytes, byteCount );
+	uint64_t h = hull->hash != 0 ? hull->hash : b3Hash64NonZero( bytes, byteCount );
 	return b3InternGeometry( &rec->registry, b3_geometryHull, h, bytes, byteCount );
 }
 
@@ -1156,7 +1168,7 @@ uint32_t b3RecInternMesh( b3Recording* rec, const b3MeshData* mesh )
 	int byteCount = mesh->byteCount;
 	uint8_t* bytes = b3Alloc( (size_t)byteCount );
 	memcpy( bytes, mesh, (size_t)byteCount );
-	uint64_t h = b3Hash64NonZero( bytes, byteCount );
+	uint64_t h = mesh->hash != 0 ? mesh->hash : b3Hash64NonZero( bytes, byteCount );
 	return b3InternGeometry( &rec->registry, b3_geometryMesh, h, bytes, byteCount );
 }
 
@@ -1165,7 +1177,7 @@ uint32_t b3RecInternHeightField( b3Recording* rec, const b3HeightFieldData* hf )
 	int byteCount = hf->byteCount;
 	uint8_t* bytes = b3Alloc( (size_t)byteCount );
 	memcpy( bytes, hf, (size_t)byteCount );
-	uint64_t h = b3Hash64NonZero( bytes, byteCount );
+	uint64_t h = hf->hash != 0 ? hf->hash : b3Hash64NonZero( bytes, byteCount );
 	return b3InternGeometry( &rec->registry, b3_geometryHeightField, h, bytes, byteCount );
 }
 
