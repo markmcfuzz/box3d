@@ -542,20 +542,29 @@ static sapp_desc BuildAppDesc( int argc, char** argv )
 			s_context.replayFollow = true;
 
 			// A writer that rebuilds its world every window needs the viewer to re-find what it was
-			// watching by NAME; ordinals shift as bodies come and go. "player" is the default because
-			// that is what Mjolnir labels the biped capsule.
+			// watching by NAME; ordinals shift as bodies come and go.
+			//
+			// **NOTHING IS NAMED "player" ANY MORE.** Mjolnir's player rig is named per node
+			// ("cyborg | bip01 pelvis"), so this default never matches and Follow Selection simply
+			// never turns itself on. Harmless, and left alone deliberately: "eye" would match, but it
+			// would also mean leaving first person drops you into following instead of a free camera.
+			// Pass --followbody to pick a real one.
 			if ( s_context.replayFollowBody[0] == '\0' )
 			{
 				snprintf( s_context.replayFollowBody, sizeof( s_context.replayFollowBody ), "player" );
 			}
 		}
-		else if ( strcmp( argv[i], "--fpv" ) == 0 )
+		else if ( strcmp( argv[i], "--no-fpv" ) == 0 )
 		{
-			s_context.replayFirstPerson = true;
+			s_context.replayFirstPerson = false;
 		}
 		else if ( strcmp( argv[i], "--followbody" ) == 0 && i + 1 < argc )
 		{
 			snprintf( s_context.replayFollowBody, sizeof( s_context.replayFollowBody ), "%s", argv[++i] );
+		}
+		else if ( strcmp( argv[i], "--no-labels" ) == 0 )
+		{
+			s_context.replayLabels = false;
 		}
 		else if ( strcmp( argv[i], "--zup" ) == 0 )
 		{
