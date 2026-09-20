@@ -11,6 +11,7 @@
 
 #include "box3d/box3d.h"
 
+#include <algorithm>
 #include <ctype.h>
 #include <float.h>
 #include <inttypes.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unordered_map>
 #include <vector>
 
@@ -140,6 +142,13 @@ static ImVec4 PanelColor( b3HexColor hexColor )
 // Mjolnir sets exactly this on the player's collider and aim marker; see player_body.lua.
 static constexpr uint64_t kFirstPersonHiddenCategory = 2;
 
+// **COLLISION HALO NEVER DRAWS.** A level's sky surfaces are mostly what seals it shut and a player clip is
+// collision and nothing else, so both have to stay in the world; they carry categories of their own instead,
+// and dropping those from the draw mask is what takes them off the screen. Hidden by default: seeing the
+// inside of a sealed level is the exception, not the point. See tags/bspMaterials.
+static constexpr uint64_t kSkyCategory = 4;
+static constexpr uint64_t kClipCategory = 8;
+
 // How far behind the eye the third person camera sits, in metres, on the frame T is pressed. The
 // wheel takes over from there, so this is only where it starts.
 //
@@ -160,6 +169,27 @@ static constexpr float kRideDistance = 15.0f;
 // VEHICLE's transform rather than the rider's -- a camera pulled back from a head sitting inside a
 // Warthog frames it off-centre and swings with the driver's aim. See player_body.lua's updateRide.
 static constexpr const char* kRideBodyName = "driver";
+
+// **ONE LABEL PER OBJECT, AND ONLY FOR OBJECTS.** Mjolnir names every body of a simulated object
+// "<slot>: <tag> | <detail>", so this prefix is what says a body belongs to one -- the level's BSP blocks and
+// the camera markers carry names too, and labelling those would bury the screen. The label text stops at the
+// pipe, so a twenty bone ragdoll reads as one "588: flood_captain" rather than twenty bone names.
+static constexpr const char* kLabelSeparator = " |";
+
+// How far a label carries. **IN METRES, WHICH IS WHAT A RECORDING HOLDS** -- Mjolnir converts Halo's world
+// units on the way in, and one of those is 3.048 m, so a number that reads right in game reads a third of the
+// distance here. 60 m is Halo's 20 wu, which is what Jojo's debugger defaults to and is about right for
+// inspecting something. The count cap is what keeps a crowd readable; this is what keeps a far overview from
+// labelling sixty things too small to read.
+static constexpr float kLabelDistance = 60.0f;
+
+// The text arena is 1024 entries for the whole app and every label costs a projection, so a crowd is capped
+// and the nearest win. 64 is already more than fits on screen legibly.
+static constexpr int kLabelLimit = 64;
+static constexpr int kLabelTextMax = 48;
+
+// Metres, Z up: enough to clear the centroid of a body the size of a person and sit about where its head is.
+static constexpr float kLabelLift = 1.0f;
 
 static constexpr int ReplayQueryTypeCount = 7;
 
@@ -272,7 +302,6 @@ public:
 		m_selQueryInstance = 0;
 		m_hoverQuery = -1;
 		m_revealSelection = false;
-		m_drawAllQueries = false;
 		m_followSelection = false;
 		m_queryIndexBuilt = false;
 		m_querySearch[0] = '\0';
@@ -301,9 +330,22 @@ public:
 
 		m_follow = m_context->replayFollow;
 		m_followCountdown = 6;
-		m_firstPerson = m_context->replayFirstPerson;
-		m_thirdPerson = m_context->replayThirdPerson;
+		// **THESE TWO MEAN "HOW IT WAS LAST FRAME", NOT "HOW IT SHOULD START".** Seeding them from the
+		// context made the first frame not count as attaching, so the free camera was never saved and
+		// leaving first person had nothing to hand back -- you came out of it parked a tenth of a metre
+		// inside the biped with no way to tell where you were. It only ever showed with --fpv; with
+		// first person on by default it would be the normal path.
+		m_firstPerson = false;
+		m_thirdPerson = false;
+		m_showLabels = m_context->replayLabels;
 		m_followStamp = 0;
+
+		// Before the load below, on purpose: with the writer gated on this file, the recording may not
+		// exist yet and only the heartbeat can bring it into being.
+		if ( m_follow )
+		{
+			OpenHeartbeat();
+		}
 
 		// A fresh open gathers the keyframe policy through the Load popup, then pre-generates every
 		// keyframe behind a progress bar. A restart reuses the persisted policy and fills the ring
@@ -338,6 +380,7 @@ public:
 	{
 		// Runs before the base destructor, which destroys the (empty) base world and resets the
 		// debug-shape pool. Destroying the player here releases the replay world's pool entries first.
+		CloseHeartbeat();
 		ClosePlayer();
 		m_context->showMetrics = m_prevShowMetrics;
 		m_context->viewZUp = m_prevViewZUp;
@@ -691,6 +734,28 @@ public:
 			return;
 		}
 
+		if ( key == KEY_O )
+		{
+			// The tree owns a whole column, and most of the time what is wanted is the scene. Ctrl+O is the
+			// sample picker and is handled in main.cpp before this, so plain O is free.
+			m_showOutline = !m_showOutline;
+			return;
+		}
+
+		if ( key == KEY_H )
+		{
+			m_showStats = !m_showStats;
+			return;
+		}
+
+		if ( key == KEY_L )
+		{
+			// A fourth glance-key, for the same reason the cameras have one: reading names off the scene is
+			// something you turn on and off while comparing it with the game, not something you go to a panel for.
+			m_showLabels = !m_showLabels;
+			return;
+		}
+
 		if ( key == KEY_Y )
 		{
 			// Straight back to the free camera from either, without having to remember which one
@@ -711,6 +776,63 @@ public:
 			SeekTo( b3RecPlayer_GetFrame( m_player ) - back );
 			m_context->pause = true;
 		}
+	}
+
+	// Open the heartbeat once and keep the handle: every beat rewrites the same fixed-width line in
+	// place rather than truncating, so a reader can be early but can never see a short file.
+	void OpenHeartbeat()
+	{
+		if ( m_heartbeat != nullptr || strlen( m_path ) == 0 )
+		{
+			return;
+		}
+
+		snprintf( m_heartbeatPath, sizeof( m_heartbeatPath ), "%s.viewer", m_path );
+		m_heartbeat = fopen( m_heartbeatPath, "wb" );
+		m_heartbeatCountdown = 0;
+	}
+
+	void CloseHeartbeat()
+	{
+		if ( m_heartbeat == nullptr )
+		{
+			return;
+		}
+
+		fclose( m_heartbeat );
+		m_heartbeat = nullptr;
+
+		// Gone means gone. Waiting out the staleness timeout would leave the writer paying for a
+		// viewer that has already stopped asking.
+		remove( m_heartbeatPath );
+		m_heartbeatPath[0] = '\0';
+	}
+
+	// Twice a second, which is well inside the writer's three second staleness window. 21 bytes.
+	void BeatHeartbeat()
+	{
+		if ( m_heartbeat == nullptr )
+		{
+			return;
+		}
+
+		if ( --m_heartbeatCountdown > 0 )
+		{
+			return;
+		}
+		m_heartbeatCountdown = 30;
+
+#ifdef _WIN32
+		unsigned pid = (unsigned)GetCurrentProcessId();
+#else
+		unsigned pid = 0;
+#endif
+
+		// Seconds since the epoch, the one clock both processes agree on without a handshake. Fixed
+		// width so the line length never changes and a partial read stays impossible.
+		fseek( m_heartbeat, 0, SEEK_SET );
+		fprintf( m_heartbeat, "b3v %010lld %05u\n", (long long)time( nullptr ), pid );
+		fflush( m_heartbeat );
 	}
 
 	// About ten times a second. The writer publishes by rename, so a poll either sees the previous
@@ -743,6 +865,12 @@ public:
 		WIN32_FILE_ATTRIBUTE_DATA attributes;
 		if ( GetFileAttributesExA( m_path, GetFileExInfoStandard, &attributes ) == 0 )
 		{
+			// A recording that was there and is gone means the writer stopped. Say so: the drawn world
+			// is the last true one, which on screen is indistinguishable from a live one.
+			if ( m_followStamp != 0 )
+			{
+				snprintf( m_status, sizeof( m_status ), "Writer stopped; showing the last window" );
+			}
 			return;
 		}
 
@@ -761,15 +889,117 @@ public:
 
 		if ( stamp == m_followStamp )
 		{
+			// The writer gates itself on our heartbeat and can also be switched off by hand, so windows
+			// stopping is normal and invisible: the last one stays on screen looking live. Three seconds
+			// is long enough that it cannot be two polls landing inside one roll.
+			if ( m_followChangedAt != 0 && time( nullptr ) - m_followChangedAt >= 3 )
+			{
+				snprintf( m_status, sizeof( m_status ), "Writer idle; showing the last window" );
+			}
 			return;
 		}
 
 		m_followStamp = stamp;
+		m_followChangedAt = time( nullptr );
+		m_status[0] = '\0';
 		CreatePlayer( true );
+	}
+
+	// Gather one label per object and draw the nearest few. Runs over the player's body list rather than the
+	// draw pass, so it costs a name read per body and nothing per triangle.
+	void DrawObjectLabels()
+	{
+		if ( m_showLabels == false || m_player == nullptr )
+		{
+			return;
+		}
+
+		m_labelBySlot.clear();
+		m_labels.clear();
+
+		const int bodyCount = b3RecPlayer_GetBodyCount( m_player );
+		for ( int i = 0; i < bodyCount; ++i )
+		{
+			const b3BodyId bodyId = b3RecPlayer_GetBodyId( m_player, i );
+			if ( B3_IS_NULL( bodyId ) )
+			{
+				continue;
+			}
+
+			const char* name = b3Body_GetName( bodyId );
+			if ( name == nullptr || isdigit( (unsigned char)name[0] ) == 0 )
+			{
+				continue;
+			}
+
+			// "<slot>: " or it is not one of ours, whatever else it starts with.
+			char* rest = nullptr;
+			const long slot = strtol( name, &rest, 10 );
+			if ( rest == nullptr || rest[0] != ':' || rest[1] != ' ' )
+			{
+				continue;
+			}
+
+			const b3Vec3 position = b3Body_GetPosition( bodyId );
+
+			auto found = m_labelBySlot.find( slot );
+			if ( found != m_labelBySlot.end() )
+			{
+				Label& label = m_labels[found->second];
+				label.sum = b3Add( label.sum, position );
+				label.count += 1;
+				continue;
+			}
+
+			Label label = {};
+			label.sum = position;
+			label.count = 1;
+
+			// Up to the separator, so the bone or node name stays in the Outline and off the screen.
+			const char* end = strstr( name, kLabelSeparator );
+			const size_t length = end != nullptr ? (size_t)( end - name ) : strlen( name );
+			snprintf( label.text, sizeof( label.text ), "%.*s", (int)( length < kLabelTextMax ? length : kLabelTextMax - 1 ),
+					  name );
+
+			m_labelBySlot[slot] = m_labels.size();
+			m_labels.push_back( label );
+		}
+
+		// Centroid of the object's bodies, which puts a ragdoll's label on the ragdoll rather than on whichever
+		// bone happened to be built first.
+		const b3Pos eye = m_camera->DrawOrigin();
+		const float reach = m_labelDistance * m_labelDistance;
+
+		for ( Label& label : m_labels )
+		{
+			const float inverse = 1.0f / (float)label.count;
+			label.at = { label.sum.x * inverse, label.sum.y * inverse, label.sum.z * inverse + kLabelLift };
+
+			const float dx = (float)( (double)label.at.x - eye.x );
+			const float dy = (float)( (double)label.at.y - eye.y );
+			const float dz = (float)( (double)label.at.z - eye.z );
+			label.distance = dx * dx + dy * dy + dz * dz;
+		}
+
+		std::sort( m_labels.begin(), m_labels.end(),
+				   []( const Label& a, const Label& b ) { return a.distance < b.distance; } );
+
+		int drawn = 0;
+		for ( const Label& label : m_labels )
+		{
+			if ( drawn >= m_labelLimit || label.distance > reach )
+			{
+				break;
+			}
+
+			DrawString( b3SubPos( b3ToPos( label.at ), GetDrawOrigin() ), { 1.0f, 1.0f, 1.0f, 1.0f }, label.text );
+			drawn += 1;
+		}
 	}
 
 	void Step() override
 	{
+		BeatHeartbeat();
 		PollFollow();
 
 		// Cheap and only while nothing is selected: a body named as the follow target may not exist
@@ -891,6 +1121,17 @@ public:
 		// and its aim marker. A recording that does not follow that convention loses nothing: default
 		// categories are all bits set, so clearing one still matches.
 		uint64_t drawMask = B3_DEFAULT_MASK_BITS;
+
+		if ( m_showSky == false )
+		{
+			drawMask &= ~kSkyCategory;
+		}
+
+		if ( m_showClip == false )
+		{
+			drawMask &= ~kClipCategory;
+		}
+
 		if ( m_context->replayFirstPerson )
 		{
 			drawMask &= ~kFirstPersonHiddenCategory;
@@ -898,16 +1139,13 @@ public:
 
 		b3World_Draw( m_replayWorldId, &debugDraw, drawMask );
 
+		DrawObjectLabels();
+
 		// Overlay query geometry and recorded hits on top of the world. The toggle draws every recorded
 		// query, otherwise just the selected one. Re-resolve the pinned query to this frame so a repeated
 		// query keeps drawing as the recording steps; it vanishes only on a frame that does not issue it.
 		m_selQuery = m_selKind == SelQuery ? ResolveSelectedQuery() : -1;
-		if ( m_drawAllQueries )
-		{
-			// Draw all, emphasizing the selected one so it stands out from the crowd.
-			b3RecPlayer_DrawFrameQueries( m_player, &debugDraw, -1, m_selQuery );
-		}
-		else if ( m_selQuery >= 0 )
+		if ( m_selQuery >= 0 )
 		{
 			b3RecPlayer_DrawFrameQueries( m_player, &debugDraw, m_selQuery, m_selQuery );
 		}
@@ -1243,12 +1481,25 @@ public:
 			// Reload on the next poll rather than remembering whatever was on disk when it was
 			// switched off.
 			m_followStamp = 0;
+			m_followChangedAt = 0;
 			m_followCountdown = 1;
+
+			// The heartbeat tracks the checkbox, so switching following off also tells the writer to
+			// stop paying for it.
+			if ( m_follow )
+			{
+				OpenHeartbeat();
+			}
+			else
+			{
+				CloseHeartbeat();
+			}
 		}
 
 		if ( ImGui::IsItemHovered() )
 		{
-			ImGui::SetTooltip( "Reload %s whenever it changes on disk", m_path );
+			ImGui::SetTooltip( "Reload %s whenever it changes on disk, and tell the writer somebody is watching",
+							   m_path );
 		}
 
 		if ( m_player == nullptr )
@@ -1263,13 +1514,11 @@ public:
 			m_selectTimelineTab = true;
 		}
 
-		// Overlay every recorded query, not just the one selected in the outline.
-		ImGui::Checkbox( "Draw All Queries", &m_drawAllQueries );
-
-		// Keep the selection centered as the recording plays. Orbit and zoom still aim the view, and the
-		// cursor is untouched, so picking and the scene tree keep working while it follows. The
-		// silhouette outline drops while following, since a centered body needs no pointing at.
-		ImGui::Checkbox( "Follow Selection", &m_followSelection );
+		// **NO "DRAW ALL QUERIES" AND NO "FOLLOW SELECTION" HERE.** Mjolnir issues no spatial queries at
+		// all, so a recording of it holds none and the first had nothing to draw. The second is reached
+		// only after the first and third person branches decline, which with first person on by default
+		// they do not -- all ticking it did was drop the selection outline. Following is still reachable
+		// where it means something, through --followbody.
 		if ( ImGui::Checkbox( "First Person (V)", &m_context->replayFirstPerson )
 			 && m_context->replayFirstPerson )
 		{
@@ -1292,6 +1541,37 @@ public:
 		{
 			ImGui::SetTooltip( "The same aim pulled back behind the body, so it turns with it "
 							   "and stays in shot. Y returns to the free camera from either." );
+		}
+
+		ImGui::Checkbox( "Outline (O)", &m_showOutline );
+		ImGui::Checkbox( "Sky Surfaces", &m_showSky );
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "The level's sky geometry. It collides -- it is most of what seals the level -- "
+							   "but the game never draws it." );
+		}
+
+		ImGui::Checkbox( "Player Clip", &m_showClip );
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "Surfaces flagged invisible: collision put there to keep the player out, "
+							   "with nothing drawn for it." );
+		}
+		ImGui::Checkbox( "Recorder Stats (H)", &m_showStats );
+		ImGui::Checkbox( "Object Labels (L)", &m_showLabels );
+
+		if ( ImGui::IsItemHovered() )
+		{
+			ImGui::SetTooltip( "Name every simulated object, once, above its bodies.\n"
+							   "The level and the camera markers are never labelled." );
+		}
+
+		if ( m_showLabels )
+		{
+			ImGui::SliderFloat( "Label Range", &m_labelDistance, 5.0f, 1000.0f, "%.0f m" );
+			ImGui::SliderInt( "Label Limit", &m_labelLimit, 1, kLabelLimit );
 		}
 
 		// View-only stand-up for recordings authored with +Z as up. The simulation is untouched.
@@ -1480,6 +1760,68 @@ public:
 		}
 	}
 
+	// **THE RECORDER'S OWN READING, MIRRORED.** A viewer can count bodies and triangles for itself, but not
+	// what any of them mean to the thing that wrote them: how many are corpses, how many NPCs are tracked, what
+	// the game's tick rate is. Mjolnir packs its performance reading into the name of one zero-collision body,
+	// because a name is the only metadata a recording carries through a reload.
+	void DrawRecorderStats()
+	{
+		if ( m_showStats == false || m_player == nullptr )
+		{
+			return;
+		}
+
+		const char* stats = nullptr;
+		const int bodyCount = b3RecPlayer_GetBodyCount( m_player );
+		for ( int i = 0; i < bodyCount; ++i )
+		{
+			const b3BodyId bodyId = b3RecPlayer_GetBodyId( m_player, i );
+			if ( B3_IS_NULL( bodyId ) )
+			{
+				continue;
+			}
+
+			const char* name = b3Body_GetName( bodyId );
+			if ( name != nullptr && strncmp( name, "stats|", 6 ) == 0 )
+			{
+				stats = name + 6;
+				break;
+			}
+		}
+
+		if ( stats == nullptr )
+		{
+			return;
+		}
+
+		// Clear of the Outline column when it is open, hard against the edge when it is not: the reading is
+		// meant to be glanced at beside the scene, not stacked on top of the tree.
+		const float fontSize = ImGui::GetFontSize();
+		const float left = m_showOutline ? 23.0f * fontSize : fontSize;
+		ImGuiViewport* vp = ImGui::GetMainViewport();
+		ImGui::SetNextWindowPos( { vp->Pos.x + left, vp->Pos.y + ImGui::GetFrameHeight() + fontSize },
+								 ImGuiCond_Always );
+		ImGui::SetNextWindowBgAlpha( 0.55f );
+
+		if ( ImGui::Begin( "Recorder", nullptr,
+						   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+							   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+							   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs ) )
+		{
+			// One field per pipe. The recorder decides what to send and how to word it, so nothing here has
+			// to be kept in step with it.
+			const char* cursor = stats;
+			while ( cursor != nullptr && cursor[0] != 0 )
+			{
+				const char* end = strchr( cursor, '|' );
+				const int length = end != nullptr ? (int)( end - cursor ) : (int)strlen( cursor );
+				ImGui::TextUnformatted( cursor, cursor + length );
+				cursor = end != nullptr ? end + 1 : nullptr;
+			}
+		}
+		ImGui::End();
+	}
+
 	// Left-edge Outline window plus the keyframe-policy popup. The selection detail lives in the right
 	// info panel (DrawControls), so the tree owns the whole column.
 	void DrawSampleWindows() override
@@ -1487,6 +1829,13 @@ public:
 		DrawLoadPopup();
 
 		if ( m_player == nullptr || m_generating )
+		{
+			return;
+		}
+
+		DrawRecorderStats();
+
+		if ( m_showOutline == false )
 		{
 			return;
 		}
@@ -2209,12 +2558,40 @@ public:
 	char m_path[256];
 	char m_status[128];
 
+	// One gathered label per object; see DrawObjectLabels. Kept as members so a busy scene does not allocate
+	// two containers every frame.
+	struct Label
+	{
+		b3Vec3 sum;
+		b3Vec3 at;
+		float distance;
+		int count;
+		char text[kLabelTextMax];
+	};
+	std::vector<Label> m_labels;
+	std::unordered_map<long, size_t> m_labelBySlot;
+	bool m_showLabels = false;
+	bool m_showStats = true;
+	bool m_showOutline = true;
+	bool m_showSky = false;
+	bool m_showClip = false;
+	float m_labelDistance = kLabelDistance;
+	int m_labelLimit = kLabelLimit;
+
 	// Follow mode: reload m_path whenever it changes on disk, so a process that keeps rewriting the
 	// same recording can be watched while it runs. Added for Mjolnir, which rolls a short window out
 	// of a live Halo session.
 	bool m_follow;
 	int m_followCountdown;
 	uint64_t m_followStamp;
+	time_t m_followChangedAt = 0;
+
+	// **A HEARTBEAT SO THE WRITER CAN STOP WHEN NOBODY IS WATCHING.** Rolling a window costs the game
+	// thread several milliseconds, and it was paying that the whole time the viewer was closed. This
+	// file is the only thing that tells it otherwise, so it is written whenever follow mode is on.
+	FILE* m_heartbeat = nullptr;
+	char m_heartbeatPath[280] = {};
+	int m_heartbeatCountdown = 0;
 
 	// Put the camera ON a body and point it the way that body faces, for matching what the game's own
 	// first person view shows. Needs a body that carries an ORIENTATION, which a collision capsule
@@ -2257,7 +2634,6 @@ public:
 	int m_selSlot;			// shape or joint slot within the selected body
 	int m_selQuery;			// resolved query index for the current frame, recomputed from the pin below
 	bool m_revealSelection; // one-shot: expand and scroll the tree to a viewport pick or search jump
-	bool m_drawAllQueries;	// overlay every recorded query, not just the selected one
 	int m_hoverQuery;		// outline query row under the cursor, drawn as a transient highlight
 
 	// Follow cam. Unlike the third person camera the character samples use, this drives the pivot only.
