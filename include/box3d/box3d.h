@@ -275,14 +275,16 @@ B3_API int b3Recording_GetSize( const b3Recording* recording );
 
 /// Begin recording world mutations into the provided buffer.
 /// The buffer is reset on each call so a single b3Recording can be reused for multiple sessions.
+/// Returns false if it refused: a locked world, a null handle, or a session already recording.
 /// @param worldId the world to record
 /// @param recording the recording handle to write into
-B3_API void b3World_StartRecording( b3WorldId worldId, b3Recording* recording );
+B3_API bool b3World_StartRecording( b3WorldId worldId, b3Recording* recording );
 
 /// End the current recording session. Writes the trailing geometry registry and
 /// backpatches the header. The buffer remains valid until the recording is destroyed.
+/// Returns false if it refused, which leaves the buffer unfinalized and still owned by the world.
 /// @param worldId the world currently being recorded
-B3_API void b3World_StopRecording( b3WorldId worldId );
+B3_API bool b3World_StopRecording( b3WorldId worldId );
 
 /// Save the recording buffer to a file. Returns true on success.
 /// @param recording the recording to save
